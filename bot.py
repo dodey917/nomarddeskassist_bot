@@ -1,5 +1,6 @@
 import os
 import logging
+import json
 from datetime import datetime
 from typing import Dict, List
 
@@ -22,23 +23,44 @@ NAME, AMOUNT, DATE, CATEGORY = range(4)
 
 class GoogleSheetManager:
     def __init__(self):
+        logger.info("Initializing Google Sheets...")
+        
         # Get credentials from environment variables
         creds_json = os.getenv('GOOGLE_CREDS_JSON')
         sheet_url = os.getenv('SHEET_URL')
         
-        if not creds_json or not sheet_url:
-            raise ValueError("Missing GOOGLE_CREDS_JSON or SHEET_URL environment variables")
+        logger.info(f"Sheet URL exists: {bool(sheet_url)}")
+        logger.info(f"Creds JSON exists: {bool(creds_json)}")
         
-        # Parse credentials from JSON string
-        import json
-        creds_dict = json.loads(creds_json)
+        if not creds_json:
+            raise ValueError("GOOGLE_CREDS_JSON environment variable is missing")
+        
+        if not sheet_url:
+            raise ValueError("SHEET_URL environment variable is missing")
+        
+        try:
+            # Try to parse the JSON to validate it
+            creds_dict = json.loads(creds_json)
+            logger.info("Creds JSON parsed successfully")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse GOOGLE_CREDS_JSON: {e}")
+            raise ValueError(f"GOOGLE_CREDS_JSON is not valid JSON: {e}")
         
         SCOPES = ['https://www.googleapis.com/auth/spreadsheets',
                   'https://www.googleapis.com/auth/drive']
         
-        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-        self.client = gspread.authorize(creds)
-        self.sheet = self.client.open_by_url(sheet_url).sheet1
+        try:
+            creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+            self.client = gspread.authorize(creds)
+            logger.info("Google Sheets authorized successfully")
+            
+            # Try to open the sheet
+            self.sheet = self.client.open_by_url(sheet_url).sheet1
+            logger.info("Google Sheet opened successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to authorize or open sheet: {e}")
+            raise
         
         # Initialize headers if sheet is empty
         if not self.sheet.get_all_values():
@@ -46,6 +68,7 @@ class GoogleSheetManager:
                 'Timestamp', 'User ID', 'Name', 'Amount', 
                 'Date', 'Category', 'Description'
             ])
+            logger.info("Initialized sheet headers")
     
     def add_transaction(self, data: Dict):
         """Add a new transaction to the sheet"""
@@ -170,59 +193,29 @@ To add a transaction, use /add command and follow the prompts.
         category = query.data
         context.user_data['category'] = category
         
-        # Ask for optional description
-        await query.edit_message_text(
-            f"Category selected: {category}\n\n"
-            "Enter a description (optional, or type 'skip'):"
-        )
-        
-        # We'll handle description in a separate step
-        return await self.handle_description(update, context)
-    
-    async def handle_description(self, update: Update, context: CallbackContext):
-        """Handle description input after category selection"""
-        # This is a bit tricky because we need to handle both callback query and message
-        
-        # For now, let's simplify and save immediately after category selection
-        # We'll modify this to use a proper conversation flow
-        
-        # Get user ID from update
-        user_id = update.effective_user.id
-        
         # Save transaction
         transaction_data = {
-            'user_id': user_id,
+            'user_id': update.effective_user.id,
             'name': context.user_data.get('name'),
             'amount': context.user_data.get('amount'),
             'date': context.user_data.get('date'),
             'category': context.user_data.get('category'),
-            'description': context.user_data.get('description', '')
+            'description': 'Added via bot'
         }
         
         try:
             self.sheet.add_transaction(transaction_data)
             
-            response = (
+            await query.edit_message_text(
                 f"✅ Transaction saved!\n\n"
                 f"Name: {transaction_data['name']}\n"
                 f"Amount: ${transaction_data['amount']:.2f}\n"
                 f"Date: {transaction_data['date']}\n"
-                f"Category: {transaction_data['category']}\n"
-                f"Description: {transaction_data['description'] or 'None'}"
+                f"Category: {transaction_data['category']}"
             )
-            
-            if hasattr(update, 'callback_query') and update.callback_query:
-                await update.callback_query.edit_message_text(response)
-            else:
-                await update.message.reply_text(response)
-                
         except Exception as e:
             logger.error(f"Error saving to sheet: {e}")
-            error_msg = "❌ Error saving transaction. Please try again."
-            if hasattr(update, 'callback_query') and update.callback_query:
-                await update.callback_query.edit_message_text(error_msg)
-            else:
-                await update.message.reply_text(error_msg)
+            await query.edit_message_text("❌ Error saving transaction. Please try again.")
         
         # Clear user data
         context.user_data.clear()
@@ -345,14 +338,20 @@ def main():
     
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_TOKEN environment variable not set")
+        print("❌ ERROR: TELEGRAM_TOKEN environment variable not set")
         return
+    
+    print(f"✅ TELEGRAM_TOKEN exists: {bool(TELEGRAM_TOKEN)}")
+    print("Initializing Google Sheets...")
     
     # Initialize Google Sheets
     try:
         sheet_manager = GoogleSheetManager()
         logger.info("✅ Google Sheets initialized successfully")
+        print("✅ Google Sheets initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize Google Sheets: {e}")
+        print(f"❌ Failed to initialize Google Sheets: {e}")
         return
     
     # Create bot
@@ -397,7 +396,8 @@ def main():
     
     # Start the bot
     logger.info("🤖 Bot is starting...")
-    print("🤖 Bot is running...")
+    print("🤖 Bot is starting...")
+    print("✅ All systems go! Bot is running and ready to receive messages.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
