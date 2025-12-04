@@ -1,8 +1,11 @@
 import os
 import logging
 import json
+import re
+import io
+import base64
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 import traceback
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -11,6 +14,7 @@ from telegram.ext import ConversationHandler
 
 import gspread
 from google.oauth2.service_account import Credentials
+from google.cloud import vision
 
 # Enable logging
 logging.basicConfig(
@@ -20,7 +24,112 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Conversation states
-NAME, AMOUNT, DATE, CATEGORY = range(4)
+RECEIPT_PHOTO, CONFIRM_DETAILS, NAME, AMOUNT, DATE, CATEGORY = range(6)
+
+class OCRProcessor:
+    """Handles OCR for receipt images"""
+    
+    def __init__(self, google_creds_json: str = None):
+        self.google_vision_client = None
+        
+        # Try to initialize Google Vision API
+        if google_creds_json:
+            try:
+                creds_dict = json.loads(google_creds_json)
+                self.google_vision_client = vision.ImageAnnotatorClient(
+                    credentials=Credentials.from_service_account_info(creds_dict)
+                )
+                logger.info("✅ Google Vision API initialized")
+                self.ocr_method = "google_vision"
+            except Exception as e:
+                logger.warning(f"Google Vision API not available: {e}")
+                self.ocr_method = "text_only"
+        else:
+            self.ocr_method = "text_only"
+    
+    async def extract_text_from_image(self, image_bytes: bytes) -> str:
+        """Extract text from image using available OCR methods"""
+        if self.ocr_method == "google_vision" and self.google_vision_client:
+            return self._extract_with_google_vision(image_bytes)
+        else:
+            # Fallback: Try to extract text from message if available
+            return ""
+    
+    def _extract_with_google_vision(self, image_bytes: bytes) -> str:
+        """Use Google Vision API for OCR"""
+        try:
+            image = vision.Image(content=image_bytes)
+            response = self.google_vision_client.text_detection(image=image)
+            
+            if response.text_annotations:
+                return response.text_annotations[0].description
+            return ""
+        except Exception as e:
+            logger.error(f"Google Vision OCR error: {e}")
+            return ""
+    
+    def parse_receipt_text(self, text: str) -> Dict[str, any]:
+        """Parse extracted text to find receipt information"""
+        parsed_info = {
+            'amount': None,
+            'date': None,
+            'items': [],
+            'store': None
+        }
+        
+        if not text:
+            return parsed_info
+        
+        # Convert to lowercase for easier matching
+        text_lower = text.lower()
+        
+        # Look for total amount (common patterns)
+        amount_patterns = [
+            r'total[\s:]*[\$€£]?\s*(\d+\.?\d*)',
+            r'amount[\s:]*[\$€£]?\s*(\d+\.?\d*)',
+            r'[\$€£]\s*(\d+\.?\d+)',
+            r'(\d+\.\d+)[\s]*[\$€£]',
+            r'balance[\s:]*[\$€£]?\s*(\d+\.?\d*)',
+            r'grand[\s]*total[\s:]*[\$€£]?\s*(\d+\.?\d*)'
+        ]
+        
+        for pattern in amount_patterns:
+            matches = re.findall(pattern, text_lower)
+            if matches:
+                try:
+                    # Take the last match (often the total)
+                    parsed_info['amount'] = float(matches[-1])
+                    logger.info(f"Found amount: ${parsed_info['amount']}")
+                    break
+                except ValueError:
+                    continue
+        
+        # Look for date patterns
+        date_patterns = [
+            r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',  # MM/DD/YYYY or DD/MM/YYYY
+            r'(\d{4}[/-]\d{1,2}[/-]\d{1,2})',    # YYYY-MM-DD
+            r'(\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4})',  # 12 Dec 2024
+            r'((jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}\s*,\s*\d{4})'  # Dec 12, 2024
+        ]
+        
+        for pattern in date_patterns:
+            match = re.search(pattern, text_lower, re.IGNORECASE)
+            if match:
+                parsed_info['date'] = match.group(1)
+                logger.info(f"Found date: {parsed_info['date']}")
+                break
+        
+        # Look for store name (often at the beginning)
+        lines = text.split('\n')
+        if lines:
+            # First non-empty line often contains store name
+            for line in lines[:5]:  # Check first 5 lines
+                line = line.strip()
+                if line and len(line) < 50:  # Reasonable length for store name
+                    parsed_info['store'] = line
+                    break
+        
+        return parsed_info
 
 class GoogleSheetManager:
     def __init__(self):
@@ -75,7 +184,11 @@ class GoogleSheetManager:
         # Initialize headers
         try:
             if not self.sheet.get_all_values():
-                headers = ['Timestamp', 'User ID', 'Name', 'Amount', 'Date', 'Category', 'Description']
+                headers = [
+                    'Timestamp', 'User ID', 'Name', 'Amount', 
+                    'Date', 'Category', 'Description', 'Store',
+                    'Receipt Text', 'Image Available'
+                ]
                 self.sheet.append_row(headers)
                 logger.info("📝 Initialized sheet headers")
         except Exception as e:
@@ -90,7 +203,10 @@ class GoogleSheetManager:
             data.get('amount'),
             data.get('date'),
             data.get('category'),
-            data.get('description', '')
+            data.get('description', ''),
+            data.get('store', ''),
+            data.get('receipt_text', '')[:500],  # Limit text length
+            data.get('has_image', False)
         ]
         self.sheet.append_row(row)
         logger.info(f"Added: {data.get('name')} - ${data.get('amount')}")
@@ -121,6 +237,7 @@ class GoogleSheetManager:
 class ReceiptBot:
     def __init__(self, sheet_manager: GoogleSheetManager):
         self.sheet = sheet_manager
+        self.ocr = OCRProcessor(os.getenv('GOOGLE_CREDS_JSON'))
         
     async def start(self, update: Update, context: CallbackContext):
         """Send welcome message"""
@@ -130,22 +247,75 @@ class ReceiptBot:
 
 Welcome to Receipt Tracker Bot!
 
-Available commands:
-/start - Show this message
-/add - Add a new transaction
-/search - Search transactions by name
-/list - List all people in records
+I can help you track receipts and expenses.
+
+📸 **To scan a receipt:**
+Just send me a photo of any receipt!
+
+📝 **Or manually add a transaction:**
+Use /add command
+
+🔍 **Other commands:**
+/search <name> - Find transactions by name
+/list - List all people
 /help - Show help
 
-To add a transaction, use /add command and follow the prompts.
+Try sending me a receipt photo now!
         """
         await update.message.reply_text(welcome_text)
         return ConversationHandler.END
     
+    async def handle_photo(self, update: Update, context: CallbackContext):
+        """Handle receipt photo upload"""
+        user = update.effective_user
+        
+        # Download the photo
+        photo_file = await update.message.photo[-1].get_file()
+        photo_bytes = await photo_file.download_as_bytearray()
+        
+        # Store in context for later use
+        context.user_data['receipt_photo'] = photo_bytes
+        context.user_data['photo_file_id'] = update.message.photo[-1].file_id
+        
+        # Process with OCR
+        await update.message.reply_text("🔍 Scanning receipt...")
+        
+        # Extract text from image
+        extracted_text = await self.ocr.extract_text_from_image(photo_bytes)
+        parsed_info = self.ocr.parse_receipt_text(extracted_text)
+        
+        # Store extracted info
+        context.user_data['receipt_text'] = extracted_text
+        context.user_data['parsed_info'] = parsed_info
+        
+        # Create response message
+        response = "✅ Receipt scanned!\n\n"
+        
+        if parsed_info.get('store'):
+            response += f"🏪 Store: {parsed_info['store']}\n"
+        
+        if parsed_info.get('amount'):
+            response += f"💰 Amount detected: ${parsed_info['amount']:.2f}\n"
+        else:
+            response += "💰 Amount: Not detected\n"
+        
+        if parsed_info.get('date'):
+            response += f"📅 Date detected: {parsed_info['date']}\n"
+        else:
+            response += "📅 Date: Not detected\n"
+        
+        response += "\n📝 Please enter the person's name for this receipt:\n"
+        response += "(Or type /cancel to abort)"
+        
+        await update.message.reply_text(response)
+        return NAME
+    
     async def add_receipt(self, update: Update, context: CallbackContext):
-        """Start transaction addition process"""
+        """Start manual transaction addition"""
         await update.message.reply_text(
-            "📝 Please enter the person's name for this transaction:\n"
+            "📸 You can send me a receipt photo, or enter details manually.\n\n"
+            "To add manually:\n"
+            "Please enter the person's name:\n"
             "(Type /cancel to abort)"
         )
         return NAME
@@ -154,32 +324,75 @@ To add a transaction, use /add command and follow the prompts.
         """Get person's name"""
         context.user_data['name'] = update.message.text
         
-        await update.message.reply_text(
-            "💰 Enter the amount (e.g., 25.50):"
-        )
+        # Check if we have amount from OCR
+        parsed_info = context.user_data.get('parsed_info', {})
+        amount = parsed_info.get('amount')
+        
+        if amount:
+            await update.message.reply_text(
+                f"💰 Amount detected: ${amount:.2f}\n"
+                "Press Enter to accept, or enter a different amount:"
+            )
+        else:
+            await update.message.reply_text(
+                "💰 Enter the amount (e.g., 25.50):"
+            )
+        
         return AMOUNT
     
     async def handle_amount(self, update: Update, context: CallbackContext):
         """Get transaction amount"""
-        try:
-            amount = float(update.message.text.replace('$', '').replace(',', ''))
-            context.user_data['amount'] = amount
-        except ValueError:
-            await update.message.reply_text("❌ Invalid amount. Please enter a number (e.g., 25.50):")
-            return AMOUNT
+        user_input = update.message.text.strip()
+        parsed_info = context.user_data.get('parsed_info', {})
+        detected_amount = parsed_info.get('amount')
         
-        await update.message.reply_text(
-            "📅 Enter the date (YYYY-MM-DD or type 'today'):"
-        )
+        # If user pressed Enter and we have detected amount, use it
+        if user_input == '' and detected_amount:
+            amount = detected_amount
+        else:
+            try:
+                amount = float(user_input.replace('$', '').replace(',', ''))
+            except ValueError:
+                await update.message.reply_text("❌ Invalid amount. Please enter a number (e.g., 25.50):")
+                return AMOUNT
+        
+        context.user_data['amount'] = amount
+        
+        # Check if we have date from OCR
+        detected_date = parsed_info.get('date')
+        
+        if detected_date:
+            await update.message.reply_text(
+                f"📅 Date detected: {detected_date}\n"
+                "Press Enter to accept, or enter a different date (YYYY-MM-DD or 'today'):"
+            )
+        else:
+            await update.message.reply_text(
+                "📅 Enter the date (YYYY-MM-DD or type 'today'):"
+            )
+        
         return DATE
     
     async def handle_date(self, update: Update, context: CallbackContext):
         """Get transaction date"""
-        date_text = update.message.text.strip()
-        if date_text.lower() == 'today':
+        user_input = update.message.text.strip()
+        parsed_info = context.user_data.get('parsed_info', {})
+        detected_date = parsed_info.get('date')
+        
+        # If user pressed Enter and we have detected date, use it
+        if user_input == '' and detected_date:
+            date_text = detected_date
+        elif user_input.lower() == 'today':
             date_text = datetime.now().strftime('%Y-%m-%d')
+        else:
+            date_text = user_input
         
         context.user_data['date'] = date_text
+        
+        # Check if we have store from OCR
+        store = parsed_info.get('store', '')
+        if store:
+            context.user_data['store'] = store
         
         # Show categories
         keyboard = [
@@ -188,6 +401,7 @@ To add a transaction, use /add command and follow the prompts.
             [InlineKeyboardButton("Shopping 🛍️", callback_data="Shopping")],
             [InlineKeyboardButton("Entertainment 🎬", callback_data="Entertainment")],
             [InlineKeyboardButton("Utilities 💡", callback_data="Utilities")],
+            [InlineKeyboardButton("Medical 🏥", callback_data="Medical")],
             [InlineKeyboardButton("Other ❓", callback_data="Other")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -206,6 +420,31 @@ To add a transaction, use /add command and follow the prompts.
         category = query.data
         context.user_data['category'] = category
         
+        # Ask for optional description
+        store = context.user_data.get('store', '')
+        if store:
+            prompt = f"Store: {store}\n\nEnter description (optional, or type 'skip'):"
+        else:
+            prompt = "Enter description (optional, or type 'skip'):"
+        
+        await query.edit_message_text(prompt)
+        
+        # Store callback query for later
+        context.user_data['callback_query'] = query
+        return await self.handle_description(update, context)
+    
+    async def handle_description(self, update: Update, context: CallbackContext):
+        """Handle description input"""
+        # Check if this is from a message or we need to get it differently
+        if update.message:
+            description = update.message.text
+            if description.lower() != 'skip':
+                context.user_data['description'] = description
+            else:
+                context.user_data['description'] = ''
+        else:
+            context.user_data['description'] = ''
+        
         # Save transaction
         transaction_data = {
             'user_id': update.effective_user.id,
@@ -213,23 +452,47 @@ To add a transaction, use /add command and follow the prompts.
             'amount': context.user_data.get('amount'),
             'date': context.user_data.get('date'),
             'category': context.user_data.get('category'),
-            'description': 'Added via bot'
+            'description': context.user_data.get('description', ''),
+            'store': context.user_data.get('store', ''),
+            'receipt_text': context.user_data.get('receipt_text', ''),
+            'has_image': 'receipt_photo' in context.user_data
         }
         
         try:
             self.sheet.add_transaction(transaction_data)
             
-            await query.edit_message_text(
-                f"✅ Transaction saved!\n\n"
-                f"Name: {transaction_data['name']}\n"
-                f"Amount: ${transaction_data['amount']:.2f}\n"
-                f"Date: {transaction_data['date']}\n"
-                f"Category: {transaction_data['category']}"
-            )
+            # Prepare success message
+            success_msg = f"✅ Receipt saved!\n\n"
+            success_msg += f"Name: {transaction_data['name']}\n"
+            success_msg += f"Amount: ${transaction_data['amount']:.2f}\n"
+            success_msg += f"Date: {transaction_data['date']}\n"
+            success_msg += f"Category: {transaction_data['category']}\n"
+            
+            if transaction_data.get('store'):
+                success_msg += f"Store: {transaction_data['store']}\n"
+            
+            if transaction_data.get('description'):
+                success_msg += f"Description: {transaction_data['description']}\n"
+            
+            if transaction_data['has_image']:
+                success_msg += "📸 Receipt image saved\n"
+            
+            # Send message
+            if 'callback_query' in context.user_data:
+                await context.user_data['callback_query'].edit_message_text(success_msg)
+            else:
+                await update.message.reply_text(success_msg)
+                
         except Exception as e:
             logger.error(f"Error saving: {e}")
-            await query.edit_message_text("❌ Error saving transaction.")
+            error_msg = "❌ Error saving receipt. Please try again."
+            
+            if 'callback_query' in context.user_data:
+                await context.user_data['callback_query'].edit_message_text(error_msg)
+            else:
+                await update.message.reply_text(error_msg)
         
+        # Clear user data
         context.user_data.clear()
         return ConversationHandler.END
     
@@ -263,11 +526,23 @@ To add a transaction, use /add command and follow the prompts.
                     f"{i}. Date: {transaction.get('Date', 'N/A')}\n"
                     f"   Amount: ${amount:.2f}\n"
                     f"   Category: {transaction.get('Category', 'N/A')}\n"
-                    f"   Description: {transaction.get('Description', '')}\n"
-                    f"   {'─' * 30}\n"
                 )
+                
+                store = transaction.get('Store', '')
+                if store:
+                    response += f"   Store: {store}\n"
+                
+                desc = transaction.get('Description', '')
+                if desc:
+                    response += f"   Note: {desc}\n"
+                
+                if transaction.get('Image Available') == 'TRUE':
+                    response += f"   📸 Has receipt image\n"
+                
+                response += f"   {'─' * 30}\n"
             
             response += f"\n💰 Total: ${total:.2f}"
+            response += f"\n📊 Count: {len(transactions)} transactions"
             
             if len(response) > 4000:
                 chunks = [response[i:i+4000] for i in range(0, len(response), 4000)]
@@ -308,28 +583,45 @@ To add a transaction, use /add command and follow the prompts.
         help_text = """
 📋 **Receipt Tracker Bot Help**
 
-**Commands:**
-/start - Start the bot
-/add - Add a new transaction
-/search <name> - Search transactions by name
-/list - List all people
-/help - Show help
+**Main Features:**
+📸 Send any receipt photo - I'll scan it automatically!
+📝 Or use /add for manual entry
 
-**How to add:**
-1. /add command
-2. Enter person's name
-3. Enter amount
-4. Enter date (or 'today')
+**Commands:**
+/start - Welcome message
+/add - Add transaction manually
+/search <name> - Find transactions by name
+/list - List all people
+/help - This message
+
+**How it works:**
+1. Send a receipt photo or use /add
+2. I'll scan for amount, date, store
+3. Enter person's name
+4. Confirm/edit details
 5. Select category
+6. Add optional description
+7. ✅ Saved to Google Sheets!
 
 **Example:**
 /search John Doe
+Shows all John's receipts
         """
         await update.message.reply_text(help_text)
+    
+    async def handle_text(self, update: Update, context: CallbackContext):
+        """Handle any text message that's not a command"""
+        # If user just sends text without command, remind them
+        if update.message and not update.message.text.startswith('/'):
+            await update.message.reply_text(
+                "📸 Send me a receipt photo to scan!\n"
+                "Or use /add for manual entry\n"
+                "Use /help for all commands"
+            )
 
 def main():
     """Start the bot"""
-    print("🚀 Starting Receipt Tracker Bot...")
+    print("🚀 Starting Receipt Tracker Bot with OCR...")
     
     # Get token
     TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
@@ -354,16 +646,32 @@ def main():
     # Create application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Conversation handler
+    # Conversation handler for manual addition
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('add', bot.add_receipt)],
+        entry_points=[
+            CommandHandler('add', bot.add_receipt),
+            MessageHandler(filters.PHOTO, bot.handle_photo)
+        ],
         states={
-            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_name)],
-            AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_amount)],
-            DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_date)],
-            CATEGORY: [CallbackQueryHandler(bot.handle_category)]
+            NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_name),
+                CommandHandler('cancel', bot.cancel)
+            ],
+            AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_amount),
+                CommandHandler('cancel', bot.cancel)
+            ],
+            DATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_date),
+                CommandHandler('cancel', bot.cancel)
+            ],
+            CATEGORY: [
+                CallbackQueryHandler(bot.handle_category),
+                CommandHandler('cancel', bot.cancel)
+            ]
         },
-        fallbacks=[CommandHandler('cancel', bot.cancel)]
+        fallbacks=[CommandHandler('cancel', bot.cancel)],
+        allow_reentry=True
     )
     
     # Add handlers
@@ -373,9 +681,16 @@ def main():
     application.add_handler(CommandHandler('list', bot.list_names))
     application.add_handler(CommandHandler('help', bot.help_command))
     
+    # Add photo handler (also handled in conversation, but separate for direct photos)
+    application.add_handler(MessageHandler(filters.PHOTO, bot.handle_photo))
+    
+    # Add text handler for non-command messages
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_text))
+    
     # Start bot
-    print("🤖 Bot is running...")
+    print("🤖 Bot is running with OCR...")
     print("📱 Send /start to your bot on Telegram")
+    print("📸 Try sending a receipt photo!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
