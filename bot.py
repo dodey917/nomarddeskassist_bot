@@ -92,24 +92,24 @@ class ReceiptBot:
         welcome_text = f"""
 👋 Hello {user.first_name}!
 
-Welcome to Receipt Scanner Bot!
+Welcome to Receipt Tracker Bot!
 
 Available commands:
 /start - Show this message
-/add - Add a new receipt manually
+/add - Add a new transaction
 /search - Search transactions by name
 /list - List all people in records
 /help - Show help
 
-To add a receipt, use /add command and follow the prompts.
+To add a transaction, use /add command and follow the prompts.
         """
         await update.message.reply_text(welcome_text)
         return ConversationHandler.END
     
     async def add_receipt(self, update: Update, context: CallbackContext):
-        """Start receipt addition process"""
+        """Start transaction addition process"""
         await update.message.reply_text(
-            "📝 Please enter the person's name for this receipt:\n"
+            "📝 Please enter the person's name for this transaction:\n"
             "(Type /cancel to abort)"
         )
         return NAME
@@ -133,7 +133,7 @@ To add a receipt, use /add command and follow the prompts.
             return AMOUNT
         
         await update.message.reply_text(
-            "📅 Enter the date (YYYY-MM-DD or today):"
+            "📅 Enter the date (YYYY-MM-DD or type 'today'):"
         )
         return DATE
     
@@ -167,51 +167,65 @@ To add a receipt, use /add command and follow the prompts.
         query = update.callback_query
         await query.answer()
         
-        context.user_data['category'] = query.data
+        category = query.data
+        context.user_data['category'] = category
         
         # Ask for optional description
         await query.edit_message_text(
-            f"Category selected: {query.data}\n\n"
+            f"Category selected: {category}\n\n"
             "Enter a description (optional, or type 'skip'):"
         )
         
+        # We'll handle description in a separate step
+        return await self.handle_description(update, context)
+    
+    async def handle_description(self, update: Update, context: CallbackContext):
+        """Handle description input after category selection"""
+        # This is a bit tricky because we need to handle both callback query and message
+        
+        # For now, let's simplify and save immediately after category selection
+        # We'll modify this to use a proper conversation flow
+        
+        # Get user ID from update
+        user_id = update.effective_user.id
+        
         # Save transaction
         transaction_data = {
-            'user_id': update.effective_user.id,
+            'user_id': user_id,
             'name': context.user_data.get('name'),
             'amount': context.user_data.get('amount'),
             'date': context.user_data.get('date'),
             'category': context.user_data.get('category'),
-            'description': ''
+            'description': context.user_data.get('description', '')
         }
         
-        # Wait for description or skip
-        @staticmethod
-        async def handle_description(update: Update, context: CallbackContext):
-            description = update.message.text
-            if description.lower() != 'skip':
-                transaction_data['description'] = description
+        try:
+            self.sheet.add_transaction(transaction_data)
             
-            try:
-                self.sheet.add_transaction(transaction_data)
+            response = (
+                f"✅ Transaction saved!\n\n"
+                f"Name: {transaction_data['name']}\n"
+                f"Amount: ${transaction_data['amount']:.2f}\n"
+                f"Date: {transaction_data['date']}\n"
+                f"Category: {transaction_data['category']}\n"
+                f"Description: {transaction_data['description'] or 'None'}"
+            )
+            
+            if hasattr(update, 'callback_query') and update.callback_query:
+                await update.callback_query.edit_message_text(response)
+            else:
+                await update.message.reply_text(response)
                 
-                await update.message.reply_text(
-                    f"✅ Transaction saved!\n\n"
-                    f"Name: {transaction_data['name']}\n"
-                    f"Amount: ${transaction_data['amount']:.2f}\n"
-                    f"Date: {transaction_data['date']}\n"
-                    f"Category: {transaction_data['category']}\n"
-                    f"Description: {transaction_data['description'] or 'None'}"
-                )
-            except Exception as e:
-                logger.error(f"Error saving to sheet: {e}")
-                await update.message.reply_text("❌ Error saving transaction. Please try again.")
-            
-            # Clear user data
-            context.user_data.clear()
-            return ConversationHandler.END
+        except Exception as e:
+            logger.error(f"Error saving to sheet: {e}")
+            error_msg = "❌ Error saving transaction. Please try again."
+            if hasattr(update, 'callback_query') and update.callback_query:
+                await update.callback_query.edit_message_text(error_msg)
+            else:
+                await update.message.reply_text(error_msg)
         
-        # We'll need to modify the conversation handler for this
+        # Clear user data
+        context.user_data.clear()
         return ConversationHandler.END
     
     async def search_transactions(self, update: Update, context: CallbackContext):
@@ -290,26 +304,29 @@ To add a receipt, use /add command and follow the prompts.
     async def help_command(self, update: Update, context: CallbackContext):
         """Show help message"""
         help_text = """
-📋 **Receipt Scanner Bot Help**
+📋 **Receipt Tracker Bot Help**
 
 **Commands:**
 /start - Start the bot
-/add - Add a new receipt manually
+/add - Add a new transaction manually
 /search <name> - Search transactions by name
 /list - List all people in records
 /help - Show this help message
 
-**How to add a receipt:**
+**How to add a transaction:**
 1. Use /add command
 2. Enter the person's name
 3. Enter the amount
 4. Enter the date (or type 'today')
 5. Select a category
-6. Add optional description
 
 **Example:**
 /search John Doe
 Shows all transactions for John Doe
+
+**Example:**
+/add
+[Follow the prompts to add a transaction]
         """
         await update.message.reply_text(help_text)
 
@@ -333,6 +350,7 @@ def main():
     # Initialize Google Sheets
     try:
         sheet_manager = GoogleSheetManager()
+        logger.info("✅ Google Sheets initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize Google Sheets: {e}")
         return
@@ -379,6 +397,7 @@ def main():
     
     # Start the bot
     logger.info("🤖 Bot is starting...")
+    print("🤖 Bot is running...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
