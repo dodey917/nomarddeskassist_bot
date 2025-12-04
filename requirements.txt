@@ -3,6 +3,3 @@ gspread==6.0.2
 google-auth==2.28.1
 google-api-python-client==2.127.0
 python-dotenv==1.0.1
-pillow==10.3.0
-google-cloud-vision==3.7.2  # For Google Vision OCR (recommended)
-# pytesseract==0.3.10  # Optional: uncomment for Tesseract OCR
