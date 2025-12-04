@@ -1,12 +1,7 @@
 import os
-import re
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional
-import pytesseract
-from PIL import Image
-import io
-import requests
+from typing import Dict, List
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
@@ -23,15 +18,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Conversation states
-RECEIPT, NAME, AMOUNT, DATE, CATEGORY = range(5)
-
-# Initialize Google Sheets
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets',
-          'https://www.googleapis.com/auth/drive']
+NAME, AMOUNT, DATE, CATEGORY = range(4)
 
 class GoogleSheetManager:
-    def __init__(self, creds_path: str, sheet_url: str):
-        creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
+    def __init__(self):
+        # Get credentials from environment variables
+        creds_json = os.getenv('GOOGLE_CREDS_JSON')
+        sheet_url = os.getenv('SHEET_URL')
+        
+        if not creds_json or not sheet_url:
+            raise ValueError("Missing GOOGLE_CREDS_JSON or SHEET_URL environment variables")
+        
+        # Parse credentials from JSON string
+        import json
+        creds_dict = json.loads(creds_json)
+        
+        SCOPES = ['https://www.googleapis.com/auth/spreadsheets',
+                  'https://www.googleapis.com/auth/drive']
+        
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
         self.client = gspread.authorize(creds)
         self.sheet = self.client.open_by_url(sheet_url).sheet1
         
@@ -39,7 +44,7 @@ class GoogleSheetManager:
         if not self.sheet.get_all_values():
             self.sheet.append_row([
                 'Timestamp', 'User ID', 'Name', 'Amount', 
-                'Date', 'Category', 'Description', 'Receipt Text'
+                'Date', 'Category', 'Description'
             ])
     
     def add_transaction(self, data: Dict):
@@ -51,8 +56,7 @@ class GoogleSheetManager:
             data.get('amount'),
             data.get('date'),
             data.get('category'),
-            data.get('description', ''),
-            data.get('receipt_text', '')
+            data.get('description', '')
         ]
         self.sheet.append_row(row)
         return True
@@ -79,47 +83,9 @@ class GoogleSheetManager:
         return list(names)
 
 class ReceiptBot:
-    def __init__(self, token: str, sheet_manager: GoogleSheetManager):
-        self.token = token
+    def __init__(self, sheet_manager: GoogleSheetManager):
         self.sheet = sheet_manager
-        self.user_data = {}
         
-    def extract_text_from_image(self, image_bytes: bytes) -> str:
-        """Extract text from receipt image using OCR"""
-        try:
-            image = Image.open(io.BytesIO(image_bytes))
-            text = pytesseract.image_to_string(image)
-            return text
-        except Exception as e:
-            logger.error(f"OCR Error: {e}")
-            return ""
-    
-    def parse_receipt_text(self, text: str) -> Dict:
-        """Parse extracted text to find relevant information"""
-        parsed = {}
-        
-        # Look for amounts (common patterns)
-        amount_patterns = [
-            r'total[\s:]*[$€£]?(\d+\.?\d*)',
-            r'amount[\s:]*[$€£]?(\d+\.?\d*)',
-            r'[$€£](\d+\.?\d*)',
-            r'(\d+\.?\d+)[\s]*[$€£]'
-        ]
-        
-        for pattern in amount_patterns:
-            matches = re.findall(pattern, text.lower())
-            if matches:
-                parsed['amount'] = float(matches[-1])
-                break
-        
-        # Look for date
-        date_pattern = r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})|(\d{4}[/-]\d{1,2}[/-]\d{1,2})'
-        date_match = re.search(date_pattern, text)
-        if date_match:
-            parsed['date'] = date_match.group()
-        
-        return parsed
-    
     async def start(self, update: Update, context: CallbackContext):
         """Send welcome message"""
         user = update.effective_user
@@ -130,12 +96,12 @@ Welcome to Receipt Scanner Bot!
 
 Available commands:
 /start - Show this message
-/add - Add a new receipt
+/add - Add a new receipt manually
 /search - Search transactions by name
 /list - List all people in records
 /help - Show help
 
-To add a receipt, send a photo or use /add command.
+To add a receipt, use /add command and follow the prompts.
         """
         await update.message.reply_text(welcome_text)
         return ConversationHandler.END
@@ -143,32 +109,8 @@ To add a receipt, send a photo or use /add command.
     async def add_receipt(self, update: Update, context: CallbackContext):
         """Start receipt addition process"""
         await update.message.reply_text(
-            "📸 Please send a photo of the receipt or type /cancel to abort."
-        )
-        return RECEIPT
-    
-    async def handle_receipt_photo(self, update: Update, context: CallbackContext):
-        """Handle receipt photo upload"""
-        user_id = update.effective_user.id
-        
-        # Download the photo
-        photo_file = await update.message.photo[-1].get_file()
-        photo_bytes = await photo_file.download_as_bytearray()
-        
-        # Extract text from receipt
-        extracted_text = self.extract_text_from_image(photo_bytes)
-        parsed_info = self.parse_receipt_text(extracted_text)
-        
-        # Store in user context
-        context.user_data['receipt_text'] = extracted_text
-        context.user_data['parsed_info'] = parsed_info
-        
-        # Ask for person's name
-        await update.message.reply_text(
-            "✅ Receipt processed!\n\n"
-            f"Extracted amount: ${parsed_info.get('amount', 'Not found')}\n"
-            f"Extracted date: {parsed_info.get('date', 'Not found')}\n\n"
-            "Please enter the person's name:"
+            "📝 Please enter the person's name for this receipt:\n"
+            "(Type /cancel to abort)"
         )
         return NAME
     
@@ -176,13 +118,9 @@ To add a receipt, send a photo or use /add command.
         """Get person's name"""
         context.user_data['name'] = update.message.text
         
-        # Ask for amount (pre-filled if detected)
-        amount = context.user_data['parsed_info'].get('amount')
-        prompt = "Enter the amount:"
-        if amount:
-            prompt = f"Enter the amount (detected: ${amount}):"
-        
-        await update.message.reply_text(prompt)
+        await update.message.reply_text(
+            "💰 Enter the amount (e.g., 25.50):"
+        )
         return AMOUNT
     
     async def handle_amount(self, update: Update, context: CallbackContext):
@@ -191,21 +129,21 @@ To add a receipt, send a photo or use /add command.
             amount = float(update.message.text.replace('$', '').replace(',', ''))
             context.user_data['amount'] = amount
         except ValueError:
-            await update.message.reply_text("❌ Invalid amount. Please enter a number:")
+            await update.message.reply_text("❌ Invalid amount. Please enter a number (e.g., 25.50):")
             return AMOUNT
         
-        # Ask for date (pre-filled if detected)
-        date = context.user_data['parsed_info'].get('date')
-        prompt = "Enter the date (YYYY-MM-DD):"
-        if date:
-            prompt = f"Enter the date (detected: {date}):"
-        
-        await update.message.reply_text(prompt)
+        await update.message.reply_text(
+            "📅 Enter the date (YYYY-MM-DD or today):"
+        )
         return DATE
     
     async def handle_date(self, update: Update, context: CallbackContext):
         """Get transaction date"""
-        context.user_data['date'] = update.message.text
+        date_text = update.message.text.strip()
+        if date_text.lower() == 'today':
+            date_text = datetime.now().strftime('%Y-%m-%d')
+        
+        context.user_data['date'] = date_text
         
         # Show categories
         keyboard = [
@@ -213,6 +151,7 @@ To add a receipt, send a photo or use /add command.
             [InlineKeyboardButton("Transport 🚗", callback_data="Transport")],
             [InlineKeyboardButton("Shopping 🛍️", callback_data="Shopping")],
             [InlineKeyboardButton("Entertainment 🎬", callback_data="Entertainment")],
+            [InlineKeyboardButton("Utilities 💡", callback_data="Utilities")],
             [InlineKeyboardButton("Other ❓", callback_data="Other")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -230,32 +169,49 @@ To add a receipt, send a photo or use /add command.
         
         context.user_data['category'] = query.data
         
-        # Save to Google Sheets
+        # Ask for optional description
+        await query.edit_message_text(
+            f"Category selected: {query.data}\n\n"
+            "Enter a description (optional, or type 'skip'):"
+        )
+        
+        # Save transaction
         transaction_data = {
             'user_id': update.effective_user.id,
             'name': context.user_data.get('name'),
             'amount': context.user_data.get('amount'),
             'date': context.user_data.get('date'),
             'category': context.user_data.get('category'),
-            'receipt_text': context.user_data.get('receipt_text', '')
+            'description': ''
         }
         
-        try:
-            self.sheet.add_transaction(transaction_data)
+        # Wait for description or skip
+        @staticmethod
+        async def handle_description(update: Update, context: CallbackContext):
+            description = update.message.text
+            if description.lower() != 'skip':
+                transaction_data['description'] = description
             
-            await query.edit_message_text(
-                f"✅ Transaction saved!\n\n"
-                f"Name: {transaction_data['name']}\n"
-                f"Amount: ${transaction_data['amount']}\n"
-                f"Date: {transaction_data['date']}\n"
-                f"Category: {transaction_data['category']}"
-            )
-        except Exception as e:
-            logger.error(f"Error saving to sheet: {e}")
-            await query.edit_message_text("❌ Error saving transaction. Please try again.")
+            try:
+                self.sheet.add_transaction(transaction_data)
+                
+                await update.message.reply_text(
+                    f"✅ Transaction saved!\n\n"
+                    f"Name: {transaction_data['name']}\n"
+                    f"Amount: ${transaction_data['amount']:.2f}\n"
+                    f"Date: {transaction_data['date']}\n"
+                    f"Category: {transaction_data['category']}\n"
+                    f"Description: {transaction_data['description'] or 'None'}"
+                )
+            except Exception as e:
+                logger.error(f"Error saving to sheet: {e}")
+                await update.message.reply_text("❌ Error saving transaction. Please try again.")
+            
+            # Clear user data
+            context.user_data.clear()
+            return ConversationHandler.END
         
-        # Clear user data
-        context.user_data.clear()
+        # We'll need to modify the conversation handler for this
         return ConversationHandler.END
     
     async def search_transactions(self, update: Update, context: CallbackContext):
@@ -268,24 +224,6 @@ To add a receipt, send a photo or use /add command.
                 "Please provide a name to search:\n"
                 "Example: /search John Doe"
             )
-    
-    async def list_names(self, update: Update, context: CallbackContext):
-        """List all names in the database"""
-        try:
-            names = self.sheet.get_all_names()
-            if names:
-                response = "📋 People in records:\n\n"
-                for i, name in enumerate(sorted(names), 1):
-                    response += f"{i}. {name}\n"
-                
-                response += "\nUse /search <name> to see transactions"
-            else:
-                response = "No records found yet."
-            
-            await update.message.reply_text(response)
-        except Exception as e:
-            logger.error(f"Error listing names: {e}")
-            await update.message.reply_text("❌ Error accessing database.")
     
     async def _show_transactions(self, update: Update, name: str):
         """Display transactions for a specific person"""
@@ -325,6 +263,24 @@ To add a receipt, send a photo or use /add command.
             logger.error(f"Error fetching transactions: {e}")
             await update.message.reply_text("❌ Error fetching transactions.")
     
+    async def list_names(self, update: Update, context: CallbackContext):
+        """List all names in the database"""
+        try:
+            names = self.sheet.get_all_names()
+            if names:
+                response = "📋 People in records:\n\n"
+                for i, name in enumerate(sorted(names), 1):
+                    response += f"{i}. {name}\n"
+                
+                response += "\nUse /search <name> to see transactions"
+            else:
+                response = "No records found yet."
+            
+            await update.message.reply_text(response)
+        except Exception as e:
+            logger.error(f"Error listing names: {e}")
+            await update.message.reply_text("❌ Error accessing database.")
+    
     async def cancel(self, update: Update, context: CallbackContext):
         """Cancel the conversation"""
         context.user_data.clear()
@@ -338,18 +294,18 @@ To add a receipt, send a photo or use /add command.
 
 **Commands:**
 /start - Start the bot
-/add - Add a new receipt
+/add - Add a new receipt manually
 /search <name> - Search transactions by name
 /list - List all people in records
 /help - Show this help message
 
 **How to add a receipt:**
 1. Use /add command
-2. Send a photo of the receipt
-3. Enter the person's name
-4. Enter the amount
-5. Enter the date
-6. Select a category
+2. Enter the person's name
+3. Enter the amount
+4. Enter the date (or type 'today')
+5. Select a category
+6. Add optional description
 
 **Example:**
 /search John Doe
@@ -357,18 +313,32 @@ Shows all transactions for John Doe
         """
         await update.message.reply_text(help_text)
 
+async def error_handler(update: Update, context: CallbackContext):
+    """Handle errors"""
+    logger.error(f"Update {update} caused error {context.error}")
+    if update and update.effective_message:
+        await update.effective_message.reply_text(
+            "❌ An error occurred. Please try again or contact support."
+        )
+
 def main():
     """Start the bot"""
     # Configuration
-    TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', 'YOUR_BOT_TOKEN')
-    GOOGLE_CREDS_PATH = os.getenv('GOOGLE_CREDS_PATH', 'credentials.json')
-    SHEET_URL = os.getenv('SHEET_URL', 'YOUR_GOOGLE_SHEET_URL')
+    TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+    
+    if not TELEGRAM_TOKEN:
+        logger.error("TELEGRAM_TOKEN environment variable not set")
+        return
     
     # Initialize Google Sheets
-    sheet_manager = GoogleSheetManager(GOOGLE_CREDS_PATH, SHEET_URL)
+    try:
+        sheet_manager = GoogleSheetManager()
+    except Exception as e:
+        logger.error(f"Failed to initialize Google Sheets: {e}")
+        return
     
     # Create bot
-    bot = ReceiptBot(TELEGRAM_TOKEN, sheet_manager)
+    bot = ReceiptBot(sheet_manager)
     
     # Create application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -377,10 +347,6 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('add', bot.add_receipt)],
         states={
-            RECEIPT: [
-                MessageHandler(filters.PHOTO, bot.handle_receipt_photo),
-                CommandHandler('cancel', bot.cancel)
-            ],
             NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_name),
                 CommandHandler('cancel', bot.cancel)
@@ -408,8 +374,11 @@ def main():
     application.add_handler(CommandHandler('list', bot.list_names))
     application.add_handler(CommandHandler('help', bot.help_command))
     
+    # Add error handler
+    application.add_error_handler(error_handler)
+    
     # Start the bot
-    print("🤖 Bot is starting...")
+    logger.info("🤖 Bot is starting...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
