@@ -1,744 +1,317 @@
 import os
 import logging
+import io
 import json
-import re
-import base64
-import asyncio
 from datetime import datetime
-from typing import Dict, List
-import traceback
+from typing import Optional, List
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from dotenv import load_dotenv
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
-from telegram.ext import ConversationHandler
-
+# Import our modules
+# Ensure ai_processor.py contains analyze_receipt and generate_sheet_query
+from ai_processor import analyze_receipt, generate_sheet_query 
+# Ensure schemas.py contains ReceiptExtraction, QuerySchema, and SearchResponse
+from schemas import ReceiptExtraction, QuerySchema, SearchResponse 
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Try to import OpenAI, but make it optional
-try:
-    import openai
-    OPENAI_AVAILABLE = True
-    print("✅ OpenAI available")
-except ImportError:
-    OPENAI_AVAILABLE = False
-    print("⚠️ OpenAI not available - AI features disabled")
-    openai = None
+# Load environment variables
+load_dotenv()
 
-# Enable logging
+# --- Configuration ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Conversation states
-CONFIRM_DETAILS, NAME, AMOUNT, DATE, CATEGORY = range(5)
+# Define the expected Google Sheet headers/order
+# IMPORTANT: This must match the order in GoogleSheetsHandler.append_transaction
+SHEET_HEADERS = [
+    "Date_Sent", 
+    "Sender_Name", 
+    "Receiver_Name", 
+    "Account_Number", 
+    "Amount", 
+    "Timestamp"
+]
 
-class AIVisionProcessor:
-    """Handles receipt analysis using OpenAI GPT-4 Vision"""
-    
-    def __init__(self, openai_api_key: str = None):
-        self.openai_client = None
-        
-        if openai_api_key and OPENAI_AVAILABLE:
-            try:
-                self.openai_client = openai.OpenAI(api_key=openai_api_key)
-                logger.info("✅ OpenAI GPT-4 Vision initialized")
-            except Exception as e:
-                logger.warning(f"OpenAI initialization failed: {e}")
-                self.openai_client = None
-        else:
-            logger.warning("OpenAI not available or no API key")
-    
-    async def analyze_receipt_image(self, image_bytes: bytes) -> Dict[str, any]:
-        """Analyze receipt image using GPT-4 Vision"""
-        if not self.openai_client:
-            logger.warning("OpenAI client not available")
-            return {
-                "store_name": "Unknown Store",
-                "total_amount": 0.00,
-                "date": datetime.now().strftime('%Y-%m-%d'),
-                "currency": "USD",
-                "summary": "AI analysis not available. Please enter details manually."
-            }
-        
-        try:
-            # Encode image to base64
-            image_b64 = base64.b64encode(image_bytes).decode('utf-8')
-            
-            # Prepare the prompt for receipt analysis
-            prompt = """Analyze this receipt image and extract:
-            1. Store/business name
-            2. Total amount paid
-            3. Date of purchase
-            4. Currency used
-            Return as JSON with keys: store_name, total_amount, date, currency"""
-            
-            # Call OpenAI API
-            response = await asyncio.to_thread(
-                self.openai_client.chat.completions.create,
-                model="gpt-4-vision-preview",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{image_b64}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                max_tokens=300
-            )
-            
-            # Extract response
-            content = response.choices[0].message.content
-            logger.info(f"OpenAI Response: {content}")
-            
-            # Try to parse JSON
-            try:
-                json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                if json_match:
-                    json_str = json_match.group()
-                    receipt_data = json.loads(json_str)
-                    logger.info(f"✅ Successfully parsed receipt data")
-                    return receipt_data
-                else:
-                    # If no JSON, create basic response
-                    return {
-                        "store_name": "Store from receipt",
-                        "total_amount": 0.00,
-                        "date": datetime.now().strftime('%Y-%m-%d'),
-                        "currency": "USD",
-                        "summary": content[:100]  # First 100 chars of response
-                    }
-            except json.JSONDecodeError:
-                # Return basic info if JSON parsing fails
-                return {
-                    "store_name": "Store from receipt",
-                    "total_amount": 0.00,
-                    "date": datetime.now().strftime('%Y-%m-%d'),
-                    "currency": "USD",
-                    "summary": content[:100]
-                }
-                
-        except Exception as e:
-            logger.error(f"OpenAI Vision error: {e}")
-            return {
-                "store_name": "Unknown Store",
-                "total_amount": 0.00,
-                "date": datetime.now().strftime('%Y-%m-%d'),
-                "currency": "USD",
-                "summary": f"Error: {str(e)[:50]}"
-            }
-    
-    def format_receipt_for_display(self, receipt_data: Dict) -> str:
-        """Format receipt data for user display"""
-        response = "🤖 **Receipt Analysis:**\n\n"
-        
-        if receipt_data.get('store_name'):
-            response += f"🏪 **Store:** {receipt_data['store_name']}\n"
-        else:
-            response += f"🏪 **Store:** Unknown\n"
-        
-        if receipt_data.get('total_amount'):
-            currency = receipt_data.get('currency', 'USD')
-            response += f"💰 **Total:** {currency} {receipt_data['total_amount']:.2f}\n"
-        else:
-            response += f"💰 **Total:** Not detected\n"
-        
-        if receipt_data.get('date'):
-            response += f"📅 **Date:** {receipt_data['date']}\n"
-        else:
-            response += f"📅 **Date:** Not detected\n"
-        
-        if receipt_data.get('summary'):
-            response += f"\n📝 **Notes:** {receipt_data['summary']}\n"
-        
-        response += "\nWould you like to save this receipt?"
-        return response
-
-class GoogleSheetManager:
+class GoogleSheetsHandler:
+    # (Content is the same as the previous version)
     def __init__(self):
-        logger.info("Initializing Google Sheets...")
-        
-        # Get credentials from environment variables
-        creds_json = os.getenv('GOOGLE_CREDS_JSON')
-        sheet_url = os.getenv('SHEET_URL')
-        
-        if not creds_json:
-            raise ValueError("GOOGLE_CREDS_JSON environment variable is missing")
-        
-        if not sheet_url:
-            raise ValueError("SHEET_URL environment variable is missing")
-        
-        # Ensure sheet_url is a full URL
-        if not sheet_url.startswith('http'):
-            # If it's just an ID, convert to full URL
-            sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_url}"
-        
+        self.scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        self.client = None
+        self.sheet = None
+        self._setup_client()
+    
+    def _setup_client(self):
+        """Setup Google Sheets client using environment variable"""
         try:
-            # Parse credentials
+            creds_json = os.getenv("GOOGLE_SHEETS_CREDENTIALS")
+            if not creds_json:
+                raise ValueError("GOOGLE_SHEETS_CREDENTIALS environment variable is required")
+            
             creds_dict = json.loads(creds_json)
-            logger.info(f"Service account: {creds_dict.get('client_email')}")
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON: {e}")
-            raise
-        
-        SCOPES = ['https://www.googleapis.com/auth/spreadsheets',
-                  'https://www.googleapis.com/auth/drive']
-        
-        try:
-            creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+            creds = Credentials.from_service_account_info(creds_dict, scopes=self.scope)
             self.client = gspread.authorize(creds)
-            logger.info("✅ Google Sheets authorized")
             
-            # Open the sheet
-            self.sheet = self.client.open_by_url(sheet_url).sheet1
-            logger.info(f"✅ Sheet opened: {self.sheet.title}")
+            spreadsheet_id = os.getenv("SPREADSHEET_ID")
+            if not spreadsheet_id:
+                raise ValueError("SPREADSHEET_ID environment variable is required")
+            
+            self.sheet = self.client.open_by_key(spreadsheet_id).sheet1
+            
+            # Ensure headers are present (optional but recommended)
+            if self.sheet.row_values(1) != SHEET_HEADERS:
+                 logger.warning("Headers not found. Attempting to set headers.")
+                 self.sheet.update([SHEET_HEADERS], 'A1')
+
+            logger.info("✅ Google Sheets client setup successfully")
             
         except Exception as e:
-            logger.error(f"Failed to open sheet: {e}")
+            logger.error(f"❌ Google Sheets setup failed: {e}")
             raise
-        
-        # Initialize headers if needed
+    
+    def append_transaction(self, extracted_data: ReceiptExtraction):
+        """Append transaction data to Google Sheet"""
         try:
-            if not self.sheet.get_all_values():
-                headers = [
-                    'Timestamp', 'User ID', 'Name', 'Amount', 
-                    'Date', 'Category', 'Description', 'Store',
-                    'AI Analysis', 'Image Available'
-                ]
-                self.sheet.append_row(headers)
-                logger.info("📝 Initialized sheet headers")
+            # The order here MUST match SHEET_HEADERS
+            row_data = [
+                extracted_data.date_sent,
+                extracted_data.sender_name,
+                extracted_data.receiver_name,
+                extracted_data.account_number,
+                f"{extracted_data.amount:.2f}", 
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")  
+            ]
+            
+            self.sheet.append_row(row_data, value_input_option='USER_ENTERED')
+            logger.info("✅ Successfully appended transaction to Google Sheets")
+            return True
+            
         except Exception as e:
-            logger.error(f"Failed to init headers: {e}")
-    
-    def add_transaction(self, data: Dict):
-        """Add a new transaction to the sheet"""
-        row = [
-            datetime.now().isoformat(),
-            data.get('user_id'),
-            data.get('name'),
-            data.get('amount'),
-            data.get('date'),
-            data.get('category'),
-            data.get('description', ''),
-            data.get('store', 'Unknown'),
-            'Yes' if data.get('ai_analysis') else 'No',
-            'Yes' if data.get('has_image') else 'No'
-        ]
-        self.sheet.append_row(row)
-        logger.info(f"Added: {data.get('name')} - ${data.get('amount')}")
-        return True
-    
-    def get_transactions_by_name(self, name: str) -> List[Dict]:
-        """Get all transactions for a specific person"""
-        all_data = self.sheet.get_all_records()
-        transactions = []
-        
-        for row in all_data:
-            if row.get('Name', '').lower() == name.lower():
-                transactions.append(row)
-        
-        logger.info(f"Found {len(transactions)} transactions for {name}")
-        return transactions
-    
-    def get_all_names(self) -> List[str]:
-        """Get list of all unique names"""
-        all_data = self.sheet.get_all_records()
-        names = set()
-        for row in all_data:
-            name = row.get('Name', '').strip()
-            if name:
-                names.add(name)
-        return list(names)
+            logger.error(f"❌ Failed to append to Google Sheets: {e}")
+            return False
 
-class ReceiptBot:
-    def __init__(self, sheet_manager: GoogleSheetManager):
-        self.sheet = sheet_manager
-        self.ai_vision = AIVisionProcessor(os.getenv('OPENAI_API_KEY'))
-        
-    async def start(self, update: Update, context: CallbackContext):
-        """Send welcome message"""
-        user = update.effective_user
-        
-        # Check if OpenAI is available
-        ai_status = "✅ AI analysis available" if self.ai_vision.openai_client else "⚠️ AI analysis not available"
-        
-        welcome_text = f"""
-👋 Hello {user.first_name}!
-
-Welcome to Receipt Scanner Bot! 📸
-
-{ai_status}
-
-**How to use:**
-1. Send me a receipt photo
-2. I'll analyze it (if AI is available)
-3. Enter the person's name
-4. Confirm details
-5. ✅ Save to Google Sheets!
-
-**Commands:**
-/add - Add transaction manually
-/search <name> - Find transactions
-/list - List all people
-/help - Show help
-
-Try sending me a receipt photo! 📸
-        """
-        await update.message.reply_text(welcome_text)
-        return ConversationHandler.END
-    
-    async def handle_photo(self, update: Update, context: CallbackContext):
-        """Handle receipt photo upload"""
+    def search_transactions(self, query: QuerySchema) -> List[SearchResponse]:
+        """Searches the Google Sheet based on a structured query."""
         try:
-            # Download the photo
-            photo_file = await update.message.photo[-1].get_file()
-            photo_bytes = await photo_file.download_as_bytearray()
+            col_index = None
+            for i, header in enumerate(SHEET_HEADERS):
+                if header.lower() == query.column_to_search.lower():
+                    col_index = i + 1
+                    break
             
-            # Store in context
-            context.user_data['receipt_photo'] = photo_bytes
-            context.user_data['has_image'] = True
+            if col_index is None:
+                logger.error(f"Invalid column search name: {query.column_to_search}")
+                return []
             
-            # Check if AI is available
-            if self.ai_vision.openai_client:
-                await update.message.reply_text("🤖 Analyzing receipt with AI...")
-                receipt_data = await self.ai_vision.analyze_receipt_image(photo_bytes)
-                context.user_data['ai_analysis'] = receipt_data
-                analysis_display = self.ai_vision.format_receipt_for_display(receipt_data)
+            matching_cells = self.sheet.findall(query.search_value, in_column=col_index)
+
+            results: List[SearchResponse] = []
+            seen_rows = set() 
+            
+            for cell in matching_cells:
+                if cell.row == 1 or cell.row in seen_rows:
+                    continue
                 
-                # Create confirmation buttons
-                keyboard = [
-                    [InlineKeyboardButton("✅ Save to Google Sheets", callback_data="save")],
-                    [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
+                row_data = self.sheet.row_values(cell.row)
                 
-                await update.message.reply_text(analysis_display, reply_markup=reply_markup)
-                return CONFIRM_DETAILS
-            else:
-                # No AI available
-                await update.message.reply_text(
-                    "📸 Photo received!\n\n"
-                    "Please enter the person's name for this receipt:\n"
-                    "(Type /cancel to abort)"
+                if len(row_data) == len(SHEET_HEADERS):
+                    data_dict = dict(zip(SHEET_HEADERS, row_data))
+                    
+                    results.append(
+                        SearchResponse(
+                            date_sent=data_dict.get('Date_Sent', 'N/A'),
+                            sender_name=data_dict.get('Sender_Name', 'N/A'),
+                            receiver_name=data_dict.get('Receiver_Name', 'N/A'),
+                            account_number=data_dict.get('Account_Number', 'N/A'),
+                            amount=data_dict.get('Amount', 'N/A'),
+                            timestamp=data_dict.get('Timestamp', 'N/A')
+                        )
+                    )
+                    seen_rows.add(cell.row)
+            
+            logger.info(f"✅ Found {len(results)} transactions for query: {query.search_value} in {query.column_to_search}")
+            return results
+        
+        except Exception as e:
+            logger.error(f"❌ Failed to search Google Sheets: {e}")
+            return []
+
+# Initialize Google Sheets handler globally
+sheets_handler = GoogleSheetsHandler()
+
+# --- Telegram Handlers ---
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send welcome message when command /start is issued."""
+    welcome_text = """
+🤖 **Advanced Receipt Processing Bot**
+
+I can extract structured data from your receipt images using AI and retrieve data from the database.
+
+**Features:**
+1.  **Image Upload:** Send a clear image of a receipt, and I will **automatically** extract and save the details to your Google Sheet.
+2.  **Data Query:** Send a text message like "What was the amount received by Michael?" or "Show me all transactions on 2025-12-01" to pull information from the sheet.
+
+Send me a receipt image or a query to get started!
+    """
+    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles incoming receipt images. 
+    This function performs AI extraction and automatic GSheet saving.
+    """
+    user = update.message.from_user
+    logger.info(f"📸 Image received from user {user.id}")
+    
+    # Check if the message is only a photo (not a photo with a caption that might trigger handle_text)
+    if update.message.caption and not filters.TEXT.check(update.message):
+        # We process it as an image, but the text query logic (handle_text) usually takes care of captions.
+        # This check is just a safety measure.
+        pass
+        
+    processing_msg = await update.message.reply_text("🔍 Scanning receipt with AI... Please wait.")
+
+    try:
+        # 1. Download the photo (Highest resolution)
+        photo_file = await update.message.photo[-1].get_file()
+        
+        # Download to memory (BytesIO)
+        image_stream = io.BytesIO()
+        await photo_file.download_to_memory(out=image_stream)
+        image_bytes = image_stream.getvalue()
+
+        # 2. Send to GPT-4o for extraction
+        extracted_data = analyze_receipt(image_bytes)
+
+        if not extracted_data:
+            await processing_msg.edit_text("❌ Could not process image. Please try again with a clearer image or ensure it's a valid receipt.")
+            return
+
+        # 3. Save to Google Sheet
+        save_success = sheets_handler.append_transaction(extracted_data)
+        
+        # 4. Reply to User
+        if save_success:
+            response_msg = (
+                f"✅ **Receipt Processed Successfully!**\n\n"
+                f"📅 **Date:** {extracted_data.date_sent}\n"
+                f"👤 **Sender:** {extracted_data.sender_name}\n"
+                f"📥 **Receiver:** {extracted_data.receiver_name}\n"
+                f"🔢 **Account:** {extracted_data.account_number}\n"
+                f"💰 **Amount:** ${extracted_data.amount:,.2f}\n\n"
+                f"💾 **Data saved to Google Sheet**"
+            )
+            await processing_msg.edit_text(response_msg, parse_mode='Markdown')
+            logger.info(f"✅ Receipt processed for user {user.id}")
+        else:
+             await processing_msg.edit_text("✅ Data extracted but **failed to save** to Google Sheet. Please check your credentials/sheet ID.")
+
+    except Exception as e:
+        logger.error(f"❌ Error processing image: {e}")
+        await processing_msg.edit_text("⚠️ An unexpected error occurred while processing the receipt. Please try again.")
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles text input, converts it to a structured query 
+    using AI, and searches the Google Sheet.
+    """
+    user_prompt = update.message.text
+    user = update.message.from_user
+    
+    # Crucial check: If a photo was sent with a caption, handle_image likely ran already. 
+    # This prevents the bot from treating the caption as a search query immediately after receipt processing.
+    if update.message.photo:
+        return # Ignore text handling if a photo was just processed
+
+    logger.info(f"📝 Text query received from user {user.id}: '{user_prompt}'")
+    
+    search_msg = await update.message.reply_text(f"🧠 Analyzing your query: *{user_prompt}*...", parse_mode='Markdown')
+
+    try:
+        # 1. Use AI to generate a structured query
+        structured_query: Optional[QuerySchema] = generate_sheet_query(user_prompt)
+
+        if not structured_query:
+            await search_msg.edit_text("❌ I couldn't understand your request or generate a valid search query. Please try phrasing it like: 'What was the transaction for Arewa Michael?'")
+            return
+
+        # 2. Search the Google Sheet
+        results: List[SearchResponse] = sheets_handler.search_transactions(structured_query)
+
+        # 3. Format and Reply
+        if not results:
+            response_text = f"❌ No transactions found matching *{structured_query.search_value}* in the '{structured_query.column_to_search.title()}' column."
+        else:
+            response_parts = [
+                f"✅ **Found {len(results)} Transaction(s) for '{structured_query.search_value}'**\n"
+            ]
+            
+            for i, transaction in enumerate(results[:5]):
+                response_parts.append(
+                    f"---\n"
+                    f"**Transaction {i+1}:**\n"
+                    f"📅 **Date:** {transaction.date_sent}\n"
+                    f"👤 **Sender:** {transaction.sender_name}\n"
+                    f"📥 **Receiver:** {transaction.receiver_name}\n"
+                    f"💰 **Amount:** ${float(transaction.amount):,.2f}"
                 )
-                return NAME
-                
-        except Exception as e:
-            logger.error(f"Error processing photo: {e}")
-            await update.message.reply_text(
-                "📸 Photo received!\n\n"
-                "Please enter the person's name:\n"
-                "(Type /cancel to abort)"
-            )
-            context.user_data['has_image'] = True
-            return NAME
-    
-    async def handle_confirmation(self, update: Update, context: CallbackContext):
-        """Handle user confirmation to save receipt"""
-        query = update.callback_query
-        await query.answer()
-        
-        if query.data == 'cancel':
-            await query.edit_message_text("❌ Receipt cancelled.")
-            context.user_data.clear()
-            return ConversationHandler.END
-        
-        # User wants to save
-        await query.edit_message_text(
-            "✅ I'll save this receipt!\n\n"
-            "Please enter the person's name:\n"
-            "(Type /cancel to abort)"
-        )
-        return NAME
-    
-    async def add_receipt(self, update: Update, context: CallbackContext):
-        """Start manual transaction addition"""
-        await update.message.reply_text(
-            "📝 Please enter the person's name:\n"
-            "(Or send a receipt photo)\n"
-            "(Type /cancel to abort)"
-        )
-        return NAME
-    
-    async def handle_name(self, update: Update, context: CallbackContext):
-        """Get person's name"""
-        context.user_data['name'] = update.message.text
-        
-        # Check if we have AI analysis data
-        receipt_data = context.user_data.get('ai_analysis', {})
-        total_amount = receipt_data.get('total_amount')
-        
-        if total_amount:
-            currency = receipt_data.get('currency', 'USD')
-            await update.message.reply_text(
-                f"💰 AI detected: {currency} {total_amount:.2f}\n"
-                "Press Enter to accept, or enter a different amount:"
-            )
-        else:
-            await update.message.reply_text("💰 Enter the amount (e.g., 25.50):")
-        
-        return AMOUNT
-    
-    async def handle_amount(self, update: Update, context: CallbackContext):
-        """Get transaction amount"""
-        user_input = update.message.text.strip()
-        receipt_data = context.user_data.get('ai_analysis', {})
-        detected_amount = receipt_data.get('total_amount')
-        
-        # If user pressed Enter and we have detected amount, use it
-        if user_input == '' and detected_amount:
-            amount = detected_amount
-        else:
-            try:
-                amount = float(user_input.replace('$', '').replace(',', ''))
-            except ValueError:
-                await update.message.reply_text("❌ Invalid amount. Please enter a number (e.g., 25.50):")
-                return AMOUNT
-        
-        context.user_data['amount'] = amount
-        
-        # Check for date from AI analysis
-        detected_date = receipt_data.get('date')
-        
-        if detected_date:
-            await update.message.reply_text(
-                f"📅 AI detected: {detected_date}\n"
-                "Press Enter to accept, or enter a different date (YYYY-MM-DD or 'today'):"
-            )
-        else:
-            await update.message.reply_text("📅 Enter the date (YYYY-MM-DD or type 'today'):")
-        
-        return DATE
-    
-    async def handle_date(self, update: Update, context: CallbackContext):
-        """Get transaction date"""
-        user_input = update.message.text.strip()
-        receipt_data = context.user_data.get('ai_analysis', {})
-        detected_date = receipt_data.get('date')
-        
-        # If user pressed Enter and we have detected date, use it
-        if user_input == '' and detected_date:
-            date_text = detected_date
-        elif user_input.lower() == 'today':
-            date_text = datetime.now().strftime('%Y-%m-%d')
-        else:
-            date_text = user_input
-        
-        context.user_data['date'] = date_text
-        
-        # Store store name from AI analysis if available
-        store = receipt_data.get('store_name', '')
-        if store:
-            context.user_data['store'] = store
-        elif 'store' not in context.user_data:
-            context.user_data['store'] = 'Unknown'
-        
-        # Show categories
-        keyboard = [
-            [InlineKeyboardButton("Food 🍔", callback_data="Food")],
-            [InlineKeyboardButton("Transport 🚗", callback_data="Transport")],
-            [InlineKeyboardButton("Shopping 🛍️", callback_data="Shopping")],
-            [InlineKeyboardButton("Entertainment 🎬", callback_data="Entertainment")],
-            [InlineKeyboardButton("Utilities 💡", callback_data="Utilities")],
-            [InlineKeyboardButton("Medical 🏥", callback_data="Medical")],
-            [InlineKeyboardButton("Other ❓", callback_data="Other")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text("Select a category:", reply_markup=reply_markup)
-        return CATEGORY
-    
-    async def handle_category(self, update: Update, context: CallbackContext):
-        """Handle category selection"""
-        query = update.callback_query
-        await query.answer()
-        
-        category = query.data
-        context.user_data['category'] = category
-        
-        await query.edit_message_text(
-            f"Category: {category}\n\n"
-            "Enter description (optional, or type 'skip'):"
-        )
-        
-        # Store callback query for later
-        context.user_data['callback_query'] = query
-        return ConversationHandler.END
-    
-    async def handle_description(self, update: Update, context: CallbackContext):
-        """Handle description input"""
-        if update.message:
-            description = update.message.text
-            if description.lower() != 'skip':
-                context.user_data['description'] = description
-            else:
-                context.user_data['description'] = ''
             
-            # Prepare transaction data
-            transaction_data = {
-                'user_id': update.effective_user.id,
-                'name': context.user_data.get('name'),
-                'amount': context.user_data.get('amount'),
-                'date': context.user_data.get('date'),
-                'category': context.user_data.get('category'),
-                'description': context.user_data.get('description', ''),
-                'store': context.user_data.get('store', 'Unknown'),
-                'ai_analysis': 'ai_analysis' in context.user_data,
-                'has_image': context.user_data.get('has_image', False)
-            }
+            if len(results) > 5:
+                 response_parts.append(f"\n...and {len(results) - 5} more results (showing first 5).")
             
-            try:
-                # Save to Google Sheets
-                self.sheet.add_transaction(transaction_data)
-                
-                # Success message
-                success_msg = f"✅ Saved to Google Sheets!\n\n"
-                success_msg += f"👤 Name: {transaction_data['name']}\n"
-                success_msg += f"💰 Amount: ${transaction_data['amount']:.2f}\n"
-                success_msg += f"📅 Date: {transaction_data['date']}\n"
-                success_msg += f"📊 Category: {transaction_data['category']}\n"
-                success_msg += f"🏪 Store: {transaction_data['store']}\n"
-                
-                if transaction_data.get('description'):
-                    success_msg += f"📝 Description: {transaction_data['description']}\n"
-                
-                if transaction_data['ai_analysis']:
-                    success_msg += "🤖 AI analyzed\n"
-                if transaction_data['has_image']:
-                    success_msg += "📸 Has receipt image\n"
-                
-                await update.message.reply_text(success_msg)
-                
-            except Exception as e:
-                logger.error(f"Error saving: {e}")
-                await update.message.reply_text("❌ Error saving to Google Sheets.")
-            
-            # Clear user data
-            context.user_data.clear()
-        
-        return ConversationHandler.END
-    
-    async def search_transactions(self, update: Update, context: CallbackContext):
-        """Search transactions by name"""
-        if context.args:
-            name = ' '.join(context.args)
-            await self._show_transactions(update, name)
-        else:
-            await update.message.reply_text("Please provide a name:\nExample: /search John Doe")
-    
-    async def _show_transactions(self, update: Update, name: str):
-        """Display transactions for a specific person"""
-        try:
-            transactions = self.sheet.get_transactions_by_name(name)
-            
-            if not transactions:
-                await update.message.reply_text(f"No transactions found for {name}")
-                return
-            
-            response = f"📊 Transactions for {name}:\n\n"
-            total = 0
-            
-            for i, transaction in enumerate(transactions, 1):
-                amount = float(transaction.get('Amount', 0))
-                total += amount
-                
-                response += (
-                    f"{i}. Date: {transaction.get('Date', 'N/A')}\n"
-                    f"   Amount: ${amount:.2f}\n"
-                    f"   Category: {transaction.get('Category', 'N/A')}\n"
-                )
-                
-                store = transaction.get('Store', '')
-                if store and store != 'Unknown':
-                    response += f"   Store: {store}\n"
-                
-                desc = transaction.get('Description', '')
-                if desc:
-                    response += f"   Note: {desc}\n"
-                
-                if transaction.get('AI Analysis') == 'Yes':
-                    response += f"   🤖 AI analyzed\n"
-                
-                response += f"   {'─' * 30}\n"
-            
-            response += f"\n💰 Total: ${total:.2f}"
-            response += f"\n📊 Count: {len(transactions)} transactions"
-            
-            await update.message.reply_text(response)
-                
-        except Exception as e:
-            logger.error(f"Error fetching: {e}")
-            await update.message.reply_text("❌ Error fetching transactions.")
-    
-    async def list_names(self, update: Update, context: CallbackContext):
-        """List all names in the database"""
-        try:
-            names = self.sheet.get_all_names()
-            if names:
-                response = "📋 People in records:\n\n"
-                for i, name in enumerate(sorted(names), 1):
-                    response += f"{i}. {name}\n"
-                response += "\nUse /search <name> to see transactions"
-            else:
-                response = "No records found yet."
-            
-            await update.message.reply_text(response)
-        except Exception as e:
-            logger.error(f"Error listing: {e}")
-            await update.message.reply_text("❌ Error accessing database.")
-    
-    async def cancel(self, update: Update, context: CallbackContext):
-        """Cancel the conversation"""
-        context.user_data.clear()
-        await update.message.reply_text("Operation cancelled.")
-        return ConversationHandler.END
-    
-    async def help_command(self, update: Update, context: CallbackContext):
-        """Show help message"""
-        help_text = """
-🤖 **Receipt Scanner Bot Help**
+            response_text = "\n".join(response_parts)
+            logger.info(f"✅ Successfully pulled {len(results)} results for user {user.id}")
 
-**Commands:**
-/start - Welcome message
-/add - Add transaction manually
-/search <name> - Find transactions
-/list - List all people
-/help - This message
+        await search_msg.edit_text(response_text, parse_mode='Markdown')
 
-**How to use:**
-1. Send a receipt photo
-2. Or use /add for manual entry
-3. Enter details when prompted
-4. ✅ Saved to Google Sheets!
+    except Exception as e:
+        logger.error(f"❌ Error handling text query: {e}")
+        await search_msg.edit_text("⚠️ An unexpected error occurred while processing your request. Please try again.")
 
-**Example:**
-/search John Doe
-        """
-        await update.message.reply_text(help_text)
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors in telegram bot."""
+    logger.error(f"Update {update} caused error {context.error}")
 
 def main():
     """Start the bot"""
-    print("🚀 Starting Receipt Scanner Bot...")
+    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     
-    # Get tokens
-    TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-    OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-    
-    if not TELEGRAM_TOKEN:
-        print("❌ TELEGRAM_TOKEN missing")
+    if not TOKEN:
+        logger.error("❌ TELEGRAM_BOT_TOKEN environment variable is required")
         return
-    
-    print(f"✅ TELEGRAM_TOKEN found")
-    print(f"🤖 OpenAI available: {OPENAI_AVAILABLE}")
-    if OPENAI_API_KEY:
-        print(f"🔑 OpenAI API Key: {'Set' if OPENAI_API_KEY else 'Not set'}")
-    
-    # Initialize Google Sheets
-    try:
-        print("📊 Initializing Google Sheets...")
-        sheet_manager = GoogleSheetManager()
-        print("✅ Google Sheets ready")
-    except Exception as e:
-        print(f"❌ Google Sheets failed: {e}")
+        
+    if not OPENAI_API_KEY:
+        logger.error("❌ OPENAI_API_KEY environment variable is required")
         return
-    
-    # Create bot
-    bot = ReceiptBot(sheet_manager)
-    
-    # Create application
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    # Conversation handler for photo analysis
-    photo_handler = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.PHOTO, bot.handle_photo)
-        ],
-        states={
-            CONFIRM_DETAILS: [
-                CallbackQueryHandler(bot.handle_confirmation),
-                CommandHandler('cancel', bot.cancel)
-            ],
-            NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_name),
-                CommandHandler('cancel', bot.cancel)
-            ],
-            AMOUNT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_amount),
-                CommandHandler('cancel', bot.cancel)
-            ],
-            DATE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_date),
-                CommandHandler('cancel', bot.cancel)
-            ],
-            CATEGORY: [
-                CallbackQueryHandler(bot.handle_category),
-                CommandHandler('cancel', bot.cancel)
-            ]
-        },
-        fallbacks=[CommandHandler('cancel', bot.cancel)],
-        allow_reentry=True
-    )
-    
-    # Conversation handler for manual addition
-    manual_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler('add', bot.add_receipt)
-        ],
-        states={
-            NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_name),
-                CommandHandler('cancel', bot.cancel)
-            ],
-            AMOUNT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_amount),
-                CommandHandler('cancel', bot.cancel)
-            ],
-            DATE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_date),
-                CommandHandler('cancel', bot.cancel)
-            ],
-            CATEGORY: [
-                CallbackQueryHandler(bot.handle_category),
-                CommandHandler('cancel', bot.cancel)
-            ]
-        },
-        fallbacks=[CommandHandler('cancel', bot.cancel)],
-        allow_reentry=True
-    )
-    
-    # Add handlers
-    application.add_handler(CommandHandler('start', bot.start))
-    application.add_handler(photo_handler)
-    application.add_handler(manual_handler)
-    application.add_handler(CommandHandler('search', bot.search_transactions))
-    application.add_handler(CommandHandler('list', bot.list_names))
-    application.add_handler(CommandHandler('help', bot.help_command))
-    
-    # Handle text messages (for description after category selection)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_description))
-    
-    # Start bot
-    print("🤖 Bot is running...")
-    print("📱 Send /start to your bot on Telegram")
-    print("📸 Try sending a receipt photo!")
-    
+
     try:
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True  # This helps prevent conflict errors
-        )
+        application = Application.builder().token(TOKEN).build()
+        
+        # Add handlers
+        application.add_handler(CommandHandler("start", start_command))
+        
+        # 1. Handler for images (Receipt upload) - **This is the handler that should run for your images.**
+        application.add_handler(MessageHandler(filters.PHOTO, handle_image))
+        
+        # 2. Handler for text (Data query) - This handles all text that IS NOT a command.
+        application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+        
+        application.add_error_handler(error_handler)
+        
+        logger.info("🤖 Bot is starting...")
+        print("✅ Bot is running on Render...")
+        
+        # Start polling
+        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        
     except Exception as e:
-        print(f"❌ Bot crashed: {e}")
-        traceback.print_exc()
+        logger.error(f"❌ Failed to start bot: {e}")
 
 if __name__ == '__main__':
     main()
