@@ -2,5 +2,6 @@ python-telegram-bot==21.7
 gspread==6.0.2
 google-auth==2.28.1
 google-api-python-client==2.127.0
-python-dotenv==1.0.1
+# The next package is typically recommended for managing environment variables (API keys)
+python-dotenv==1.0.1 
 openai==1.16.2
