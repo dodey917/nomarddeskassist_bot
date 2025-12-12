@@ -34,11 +34,12 @@ class AIVisionProcessor:
         
         if openai_api_key:
             try:
-                # Fixed: Use correct OpenAI client initialization
+                # Simplified OpenAI client initialization
                 self.openai_client = OpenAI(api_key=openai_api_key)
                 logger.info("✅ OpenAI GPT-4 Vision initialized")
             except Exception as e:
                 logger.warning(f"OpenAI initialization failed: {e}")
+                traceback.print_exc()
         else:
             logger.warning("No OpenAI API key provided")
     
@@ -133,7 +134,7 @@ class AIVisionProcessor:
         
         if receipt_data.get('total_amount'):
             currency = receipt_data.get('currency', 'USD')
-            response += f"💰 **Total:** {currency} {rece_data['total_amount']:.2f}\n"
+            response += f"💰 **Total:** {currency} {receipt_data['total_amount']:.2f}\n"
         
         if receipt_data.get('date'):
             response += f"📅 **Date:** {receipt_data['date']}\n"
@@ -284,7 +285,6 @@ class ReceiptBot:
     def __init__(self, sheet_manager: GoogleSheetManager):
         self.sheet = sheet_manager
         self.ai_vision = AIVisionProcessor(os.getenv('OPENAI_API_KEY'))
-        self.user_data_lock = asyncio.Lock()
         
     async def start(self, update: Update, context: CallbackContext):
         """Send welcome message"""
@@ -312,7 +312,7 @@ I use AI to analyze receipt photos and save them to Google Sheets.
 
 Try sending me a receipt photo now! 📸
         """
-        await update.message.reply_text(welcome_text)
+        await update.message.reply_text(welcome_text, parse_mode='Markdown')
         return ConversationHandler.END
     
     async def handle_photo(self, update: Update, context: CallbackContext):
@@ -348,7 +348,7 @@ Try sending me a receipt photo now! 📸
             response = analysis_display + "\n\n"
             response += "Would you like to save this to Google Sheets?"
             
-            await update.message.reply_text(response, reply_markup=reply_markup)
+            await update.message.reply_text(response, reply_markup=reply_markup, parse_mode='Markdown')
             
             return CONFIRM_DETAILS
             
@@ -462,9 +462,10 @@ Try sending me a receipt photo now! 📸
         else:
             date_text = user_input
         
-        # Validate date format
+        # Validate date format (optional step)
         try:
-            datetime.strptime(date_text, '%Y-%m-%d')
+            if date_text:  # Allow empty for now
+                datetime.strptime(date_text, '%Y-%m-%d')
         except ValueError:
             await update.message.reply_text("❌ Invalid date format. Please use YYYY-MM-DD:")
             return DATE
@@ -524,10 +525,7 @@ Try sending me a receipt photo now! 📸
         
         summary += "\nEnter description (optional, or type 'skip'):"
         
-        await query.edit_message_text(summary)
-        
-        # Store message for later reference
-        context.user_data['last_message'] = query.message.message_id
+        await query.edit_message_text(summary, parse_mode='Markdown')
         return DESCRIPTION
     
     async def handle_description(self, update: Update, context: CallbackContext):
@@ -581,7 +579,7 @@ Try sending me a receipt photo now! 📸
             
             success_msg += "\nUse /search to view transactions or send another receipt!"
             
-            await update.message.reply_text(success_msg)
+            await update.message.reply_text(success_msg, parse_mode='Markdown')
             
         except Exception as e:
             logger.error(f"Error saving: {e}")
@@ -747,10 +745,10 @@ def main():
     # Create bot
     bot = ReceiptBot(sheet_manager)
     
-    # Create application with persistence to avoid conflicts
+    # Create application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Conversation handler for photo analysis
+    # Conversation handler for photo analysis (FIXED: removed per_message=True)
     photo_handler = ConversationHandler(
         entry_points=[
             MessageHandler(filters.PHOTO, bot.handle_photo)
@@ -782,10 +780,10 @@ def main():
             ]
         },
         fallbacks=[CommandHandler('cancel', bot.cancel)],
-        per_message=True  # Fixed: Enable per_message tracking
+        allow_reentry=True
     )
     
-    # Conversation handler for manual addition
+    # Conversation handler for manual addition (FIXED: removed per_message=True)
     manual_handler = ConversationHandler(
         entry_points=[
             CommandHandler('add', bot.add_receipt)
@@ -813,7 +811,7 @@ def main():
             ]
         },
         fallbacks=[CommandHandler('cancel', bot.cancel)],
-        per_message=True  # Fixed: Enable per_message tracking
+        allow_reentry=True
     )
     
     # Add handlers
@@ -829,39 +827,49 @@ def main():
     async def error_handler(update: object, context: CallbackContext) -> None:
         """Log errors."""
         logger.error(f"Exception while handling update: {update}", exc_info=context.error)
+        if context.error:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id if update and update.effective_chat else None,
+                text=f"An error occurred: {context.error}"
+            )
     
     application.add_error_handler(error_handler)
     
-    # Start bot with webhook settings for Render
-    print("🤖 Bot is running with GPT-4 Vision...")
+    # Start bot with webhook for Render
+    print("🤖 Bot is running...")
     print("📱 Send /start to your bot on Telegram")
     print("📸 Try sending a receipt photo for AI analysis!")
     
-    # For Render, use webhook instead of polling
-    RENDER = os.getenv('RENDER', 'false').lower() == 'true'
+    # Check if running on Render
+    IS_RENDER = os.getenv('RENDER', '').lower() == 'true'
     
-    if RENDER:
-        # Webhook configuration for Render
+    if IS_RENDER:
+        print("🌐 Running on Render with webhook...")
         PORT = int(os.getenv('PORT', 10000))
         WEBHOOK_URL = os.getenv('WEBHOOK_URL')
         
         if WEBHOOK_URL:
-            print(f"🌐 Using webhook: {WEBHOOK_URL}")
+            print(f"🌐 Webhook URL: {WEBHOOK_URL}")
+            # Set webhook
             application.run_webhook(
                 listen="0.0.0.0",
                 port=PORT,
                 url_path=TELEGRAM_TOKEN,
-                webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}"
+                webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}",
+                drop_pending_updates=True
             )
         else:
-            print("⚠️  WEBHOOK_URL not set, falling back to polling")
-            application.run_polling(allowed_updates=Update.ALL_TYPES)
+            print("⚠️  WEBHOOK_URL not set, using polling")
+            application.run_polling(
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES
+            )
     else:
-        # Local development with polling
-        print("🏠 Running in local polling mode")
+        # Local development
+        print("🏠 Running locally with polling...")
         application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True  # Fixed: Clear any pending updates to avoid conflicts
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
         )
 
 if __name__ == '__main__':
